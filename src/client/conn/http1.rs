@@ -260,15 +260,27 @@ where
 {
     type Output = crate::Result<()>;
 
+    /***
+     *  connection 异步 poll 用于拉取状态
+     */
     fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        // 此处的 inner 是一个 Option<Dispatcher<T, B>>
+        // 调用 内部的 dispatch poll 方法
+        // 如果是在 pending 状态，那么就会返回 pending
+        // 如果是在 ready 状态，那么就会返回 ready
         match ready!(Pin::new(self.inner.as_mut().unwrap()).poll(cx))? {
+            // shutdown 状态表示已经处理完一次通讯
             proto::Dispatched::Shutdown => Poll::Ready(Ok(())),
+            // 如果是 upgrade 状态, 有可能是 http 1.x 协议
             proto::Dispatched::Upgrade(pending) => match self.inner.take() {
+                // 通过 take 拿走 inner 的值，然后通过 match 匹配, 如果 inner 第一次被拿走
+                // 说明是第一次升级, 进行升级操作
                 Some(h1) => {
                     let (io, buf, _) = h1.into_inner();
                     pending.fulfill(Upgraded::new(io, buf));
                     Poll::Ready(Ok(()))
                 }
+                // 若 take 之后为 none 则代表已经升级过了
                 _ => {
                     drop(pending);
                     unreachable!("Upgraded twice");
@@ -297,6 +309,7 @@ impl Builder {
         }
     }
 
+    // 设置是否兼容 http/0.9 协议
     /// Set whether HTTP/0.9 responses should be tolerated.
     ///
     /// Default is false.
@@ -322,6 +335,7 @@ impl Builder {
     /// Default is false.
     ///
     /// [RFC 7230 Section 3.2.4.]: https://tools.ietf.org/html/rfc7230#section-3.2.4
+    /// 设置是否允许空格在 header name 和 冒号之间 存在 in responses
     pub fn allow_spaces_after_header_name_in_responses(
         &mut self,
         enabled: bool,

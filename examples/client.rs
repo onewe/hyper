@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
         Some(url) => url,
         None => {
             println!("Usage: client <url>");
-            return Ok(());
+            "http://127.0.0.1:1337".to_string()
         }
     };
 

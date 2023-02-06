@@ -12,13 +12,19 @@ pub(crate) type RetryPromise<T, U> = oneshot::Receiver<Result<U, (crate::Error, 
 pub(crate) type Promise<T> = oneshot::Receiver<Result<T, crate::Error>>;
 
 pub(crate) fn channel<T, U>() -> (Sender<T, U>, Receiver<T, U>) {
+    // 创建一个无界的 channel
     let (tx, rx) = mpsc::unbounded_channel();
+    // 使用 want 库来实现拉取消息
     let (giver, taker) = want::new();
+
+    // 创建一个 sender, 使用 giver 来接受 want 请求, 然后发送消息到 receiver 
     let tx = Sender {
         buffered_once: false,
         giver,
         inner: tx,
     };
+
+    // 创建一个 receiver , 使用 taker 来请求 want, 然后从 接受消息
     let rx = Receiver { inner: rx, taker };
     (tx, rx)
 }
