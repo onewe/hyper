@@ -37,6 +37,7 @@ pub(crate) struct Sender<T, U> {
     /// One message is always allowed, even if the Receiver hasn't asked
     /// for it yet. This boolean keeps track of whether we've sent one
     /// without notice.
+    /// 在不通知的情况下, 发送一个消息
     buffered_once: bool,
     /// The Giver helps watch that the the Receiver side has been polled
     /// when the queue is empty. This helps us know when a request and
@@ -44,6 +45,7 @@ pub(crate) struct Sender<T, U> {
     /// for more.
     giver: want::Giver,
     /// Actually bounded by the Giver, plus `buffered_once`.
+    /// 实际上是有界限的 channel 通过 giver 和 buffered_once 限制
     inner: mpsc::UnboundedSender<Envelope<T, U>>,
 }
 
@@ -59,6 +61,10 @@ pub(crate) struct UnboundedSender<T, U> {
 }
 
 impl<T, U> Sender<T, U> {
+    /**
+     * pool ready 用来判断是否可以发送消息
+     * 如果 receiver 没有准备好, 则返回 Poll::Pending
+     */
     pub(crate) fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
         self.giver
             .poll_want(cx)
@@ -77,11 +83,13 @@ impl<T, U> Sender<T, U> {
     */
 
     fn can_send(&mut self) -> bool {
+        // 判断 receiver 是否准备好接收消息
         if self.giver.give() || !self.buffered_once {
             // If the receiver is ready *now*, then of course we can send.
             //
             // If the receiver isn't ready yet, but we don't have anything
             // in the channel yet, then allow one message.
+            // 如果 receiver 还没有准备好接收消息, 但是 channel 中没有消息, 则允许发送一个消息
             self.buffered_once = true;
             true
         } else {
