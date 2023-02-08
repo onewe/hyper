@@ -504,7 +504,7 @@ impl Builder {
 
         async move {
             tracing::trace!("client handshake HTTP/1");
-
+            // 创建一个 channel, 
             let (tx, rx) = dispatch::channel();
             let mut conn = proto::Conn::new(io);
             conn.set_h1_parser_config(opts.h1_parser_config);

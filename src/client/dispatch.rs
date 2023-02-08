@@ -110,10 +110,18 @@ impl<T, U> Sender<T, U> {
     }
 
     pub(crate) fn send(&mut self, val: T) -> Result<Promise<U>, T> {
+        // 判断是否能够发送
         if !self.can_send() {
             return Err(val);
         }
+        // 打开 oneshot channel
         let (tx, rx) = oneshot::channel();
+        // 此处的 inner 是一个无界的 channel
+        // 发送一个 Envelope 消息, 其中包含了 值和 callback 对象
+        // callback 对象是 oneshot channel 中的 sender tx
+
+        // 发送之后返回 rx, 用来接收响应
+        // RetryPromise == Receiver
         self.inner
             .send(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
             .map(move |_| rx)
@@ -123,7 +131,10 @@ impl<T, U> Sender<T, U> {
     #[cfg(feature = "http2")]
     pub(crate) fn unbound(self) -> UnboundedSender<T, U> {
         UnboundedSender {
+            // 把 giver 转换为 sharedGiver
+            // sharedGiver 可以被 clone, 但是不能 poll, 只能用于判断通道是否被关闭
             giver: self.giver.shared(),
+            // inner 本身就是无界的 channel
             inner: self.inner,
         }
     }
@@ -137,6 +148,9 @@ impl<T, U> UnboundedSender<T, U> {
     }
     */
 
+    /***
+     * 判断 通道是否被关闭
+     */
     pub(crate) fn is_closed(&self) -> bool {
         self.giver.is_canceled()
     }
@@ -151,7 +165,12 @@ impl<T, U> UnboundedSender<T, U> {
     }
 
     pub(crate) fn send(&mut self, val: T) -> Result<Promise<U>, T> {
+        // 打开 oneshot 通道
         let (tx, rx) = oneshot::channel();
+        // 发送消息并带有一个 callback 对象
+        // 返回一个 promise 对象, 用来接收响应
+
+        // RetryPromise == Receiver
         self.inner
             .send(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
             .map(move |_| rx)
@@ -179,10 +198,14 @@ impl<T, U> Receiver<T, U> {
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Option<(T, Callback<T, U>)>> {
+        // 拉取内部 inner channel 中的消息 
         match self.inner.poll_recv(cx) {
+            // 如果已经有消息存在于 channel 则返回 ready
+            // 并把消息中的 Envelope 中的值取出来
             Poll::Ready(item) => {
                 Poll::Ready(item.map(|mut env| env.0.take().expect("envelope not dropped")))
             }
+            // 如果还没有消息, 则调用 taker 的 want 方式通知 giver 可以发送消息了 然后进入 pending 状态
             Poll::Pending => {
                 self.taker.want();
                 Poll::Pending
@@ -192,13 +215,17 @@ impl<T, U> Receiver<T, U> {
 
     #[cfg(feature = "http1")]
     pub(crate) fn close(&mut self) {
+        // 取消 taker 的 want 状态 用于通知 giver 不要再发送消息了
         self.taker.cancel();
+        // 关闭 通道
         self.inner.close();
     }
 
     #[cfg(feature = "http1")]
     pub(crate) fn try_recv(&mut self) -> Option<(T, Callback<T, U>)> {
         use futures_util::FutureExt;
+        // now_or_never 这个方式是用于立即获取 channel 中的消息, 如果此时 receiver 已经 ready 则返回 Some(Some(xxx))
+        // 如果此时 receiver 返回 pending 则返回 None
         match self.inner.recv().now_or_never() {
             Some(Some(mut env)) => env.0.take(),
             _ => None,
@@ -210,14 +237,21 @@ impl<T, U> Drop for Receiver<T, U> {
     fn drop(&mut self) {
         // Notify the giver about the closure first, before dropping
         // the mpsc::Receiver.
+        // 通知 giver 通道已经关闭了 在 drop 之前
         self.taker.cancel();
     }
 }
 
+/***
+ * 一个消息对象 包含了 发送的值 和 一个 callback 对象 
+ * callback 对象一般是 oneshot channel 中的 sender
+ */
 struct Envelope<T, U>(Option<(T, Callback<T, U>)>);
 
 impl<T, U> Drop for Envelope<T, U> {
     fn drop(&mut self) {
+        // 在 drop 之前获取 envelope 中的值, 然后获取 callback 对象
+        // 发送错误给 callback 对象
         if let Some((val, cb)) = self.0.take() {
             cb.send(Err((
                 crate::Error::new_canceled().with("connection closed"),
@@ -237,18 +271,24 @@ impl<T, U> Drop for Callback<T, U> {
     fn drop(&mut self) {
         // FIXME(nox): What errors do we want here?
         let error = crate::Error::new_user_dispatch_gone().with(if std::thread::panicking() {
+            // 判断用户线程是否被 panic
             "user code panicked"
         } else {
+            // 运行时drop 了 dispatch task
             "runtime dropped the dispatch task"
         });
 
+        // 判断类型是否是 retry 类型
         match self {
             Callback::Retry(tx) => {
+                // 如果是 retry 类型 获取 callback 中的 sender
+                // 利用 sender 发送错误给 receiver
                 if let Some(tx) = tx.take() {
                     let _ = tx.send(Err((error, None)));
                 }
             }
             Callback::NoRetry(tx) => {
+                // 如果是 非 retry 类型 则直接发送错误给 receiver
                 if let Some(tx) = tx.take() {
                     let _ = tx.send(Err(error));
                 }
@@ -258,6 +298,8 @@ impl<T, U> Drop for Callback<T, U> {
 }
 
 impl<T, U> Callback<T, U> {
+    // 判断 callback 中的 tx 是否已经被关闭了
+    // 如果已经被关闭了 则不能进行回调操作
     #[cfg(feature = "http2")]
     pub(crate) fn is_canceled(&self) -> bool {
         match *self {
@@ -267,6 +309,8 @@ impl<T, U> Callback<T, U> {
         }
     }
 
+    // 判断 channel 是否已经被关闭了 如果返回 pending 则表示 channel 还没有被关闭
+    // 如果返回 ready 则表示 channel 已经被关闭了
     pub(crate) fn poll_canceled(&mut self, cx: &mut task::Context<'_>) -> Poll<()> {
         match *self {
             Callback::Retry(Some(ref mut tx)) => tx.poll_closed(cx),
@@ -275,6 +319,7 @@ impl<T, U> Callback<T, U> {
         }
     }
 
+    // 发送消息给 receiver
     pub(crate) fn send(mut self, val: Result<U, (crate::Error, Option<T>)>) {
         match self {
             Callback::Retry(ref mut tx) => {
@@ -295,6 +340,10 @@ impl<T, U> Callback<T, U> {
         use tracing::trace;
 
         let mut cb = Some(self);
+
+        // poll_fn 会 poll 传入的 future, 并且会在 future 返回 ready 之后 会把 future 的结果 发送给 callback 的 receiver
+        // 如果是 pending 状态则会判断 callback 中的 channel 是否被关闭, 如果没有关闭直接返回 pending, 如果关闭了则返回 ready
+        // 如果 ready 状态有 error 则提取 error 通过 callback 的 receiver 发送给 receiver
 
         // "select" on this callback being canceled, and the future completing
         future::poll_fn(move |cx| {
