@@ -509,6 +509,10 @@ impl Cursor<Vec<u8>> {
         self.pos = 0;
     }
 
+    /**
+     * 重置 position 为 0
+     * 清空 bytes 数组
+     */
     fn reset(&mut self) {
         self.pos = 0;
         self.bytes.clear();
@@ -525,16 +529,26 @@ impl<T: AsRef<[u8]>> fmt::Debug for Cursor<T> {
 }
 
 impl<T: AsRef<[u8]>> Buf for Cursor<T> {
+    /**
+     * 计算剩余空间大小
+     * bytes数组长度 - position = remaining
+     */
     #[inline]
     fn remaining(&self) -> usize {
         self.bytes.as_ref().len() - self.pos
     }
 
+    /***
+     * 从 position 开始返回一个字节数组切片
+     */
     #[inline]
     fn chunk(&self) -> &[u8] {
         &self.bytes.as_ref()[self.pos..]
     }
-
+    /**
+     * 增加 position 到 cnt
+     *  
+    */
     #[inline]
     fn advance(&mut self, cnt: usize) {
         debug_assert!(self.pos + cnt <= self.bytes.as_ref().len());
@@ -545,10 +559,14 @@ impl<T: AsRef<[u8]>> Buf for Cursor<T> {
 // an internal buffer to collect writes before flushes
 pub(super) struct WriteBuf<B> {
     /// Re-usable buffer that holds message headers
+    /// 一个存放字节数组的游标
     headers: Cursor<Vec<u8>>,
+    // 最大缓冲区大小
     max_buf_size: usize,
     /// Deque of user buffers if strategy is Queue
+    /// 如果 writeStrategy 为 Queue，那么就会使用这个队列
     queue: BufList<B>,
+    // 写入策略 策略分别有 Flatten 和 Queue
     strategy: WriteStrategy,
 }
 
@@ -567,16 +585,25 @@ impl<B> WriteBuf<B>
 where
     B: Buf,
 {
+    /***
+     * 设置 writeBuf 的写入策略
+     */
     fn set_strategy(&mut self, strategy: WriteStrategy) {
         self.strategy = strategy;
     }
 
+    /***
+     * 缓存数据
+     */
     pub(super) fn buffer<BB: Buf + Into<B>>(&mut self, mut buf: BB) {
         debug_assert!(buf.has_remaining());
+        // 根据不同的策略来使用不同的写入方式来缓存数据
         match self.strategy {
             WriteStrategy::Flatten => {
+                // 获取 字节数组的游标对象
                 let head = self.headers_mut();
-
+                
+                // 调整大小 用于适配 buf 的大小
                 head.maybe_unshift(buf.remaining());
                 trace!(
                     self.len = head.remaining(),
@@ -587,13 +614,18 @@ where
                 //but accomplishes the same result.
                 loop {
                     let adv = {
+                        // 获取字节数组切片
                         let slice = buf.chunk();
+                        // 判断切片是否为空 如果为空则代表没有数据可读取了
                         if slice.is_empty() {
                             return;
                         }
+                        // 把切片的数据追加到 bytes 数组中
                         head.bytes.extend_from_slice(slice);
+                        // 返回切片的长度
                         slice.len()
                     };
+                    // 调整 buf 的 position 增加 adv
                     buf.advance(adv);
                 }
             }
@@ -603,14 +635,21 @@ where
                     buf.len = buf.remaining(),
                     "buffer.queue"
                 );
+                // 把 字节数组添加到队列中
                 self.queue.push(buf.into());
             }
         }
     }
 
+    /***
+     * 判断是否还能缓存
+     */
     fn can_buffer(&self) -> bool {
         match self.strategy {
+            // 如果是 Flatten 模式直接判断余量是否达到 最大值
             WriteStrategy::Flatten => self.remaining() < self.max_buf_size,
+            // 如果是 Queue 模式 判断队列缓存的数量是否大于最大队列缓存 buf 数量
+            // 并且判断 队列中所有的 buf 余量的综合
             WriteStrategy::Queue => {
                 self.queue.bufs_cnt() < MAX_BUF_LIST_BUFFERS && self.remaining() < self.max_buf_size
             }
@@ -635,11 +674,16 @@ impl<B: Buf> fmt::Debug for WriteBuf<B> {
 impl<B: Buf> Buf for WriteBuf<B> {
     #[inline]
     fn remaining(&self) -> usize {
+        // 获取 buf 的可用空间 余量
+        // 在 Flatten 模式下 self.queue.remaining() 为 0
+        // 在 Queue 模式下 self.headers.remaining() 为 0
         self.headers.remaining() + self.queue.remaining()
     }
 
     #[inline]
     fn chunk(&self) -> &[u8] {
+        // 在 Flatten 模式下 queue.chunk() is empty
+        // 在 Queue 模式下 headers.chunk() is empty
         let headers = self.headers.chunk();
         if !headers.is_empty() {
             headers
@@ -650,8 +694,15 @@ impl<B: Buf> Buf for WriteBuf<B> {
 
     #[inline]
     fn advance(&mut self, cnt: usize) {
+        // 获取 header 的余量
         let hrem = self.headers.remaining();
-
+        // 比较
+        // 如果余量等于跳过的数量  headers 重置为0
+        // 如果余量大于跳过的数量   跳过 cnt 个字节
+        // 如果余量小于跳过的数量   重置 headers 并且 使用 跳过字节数 - 余量 = 结果 来调整 缓存队列跳过的字节大, 因为 queue 里面判断了 只有跳过数量大于0 才会进行调整
+        // 最后一块儿的代码同时解决了2种情况 
+        //      一种是余量的确小于跳过的数量
+        //      一种是 Queue 模式下 headers 为空
         match hrem.cmp(&cnt) {
             cmp::Ordering::Equal => self.headers.reset(),
             cmp::Ordering::Greater => self.headers.advance(cnt),
@@ -665,7 +716,11 @@ impl<B: Buf> Buf for WriteBuf<B> {
 
     #[inline]
     fn chunks_vectored<'t>(&'t self, dst: &mut [IoSlice<'t>]) -> usize {
+        // 填充 dst 到 headers
         let n = self.headers.chunks_vectored(dst);
+        // 在填充到 queue 中 从 n 开始
+
+        // 返回结果等于 第一个填充结果长度 + 第二个填充结果长度
         self.queue.chunks_vectored(&mut dst[n..]) + n
     }
 }
