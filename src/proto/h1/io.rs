@@ -59,11 +59,13 @@ where
     B: Buf,
 {
     pub(crate) fn new(io: T) -> Buffered<T, B> {
+        // 判断 io 写的时候是否支持 vectored 如果不支持则使用 flatten 模式
         let strategy = if io.is_write_vectored() {
             WriteStrategy::Queue
         } else {
             WriteStrategy::Flatten
         };
+        // 创建一个 writeBuf 使用上面指定的写入的策略
         let write_buf = WriteBuf::new(strategy);
         Buffered {
             flush_pipeline: false,
@@ -461,12 +463,18 @@ impl Default for ReadStrategy {
     }
 }
 
+/***
+ * 一个字节数组的游标
+ */
 #[derive(Clone)]
 pub(crate) struct Cursor<T> {
     bytes: T,
     pos: usize,
 }
 
+/***
+ * 一个字节数组切片的游标
+ */
 impl<T: AsRef<[u8]>> Cursor<T> {
     #[inline]
     pub(crate) fn new(bytes: T) -> Cursor<T> {
@@ -478,18 +486,26 @@ impl Cursor<Vec<u8>> {
     /// If we've advanced the position a bit in this cursor, and wish to
     /// extend the underlying vector, we may wish to unshift the "read" bytes
     /// off, and move everything else over.
+    /// 
+    /// 简单来说是来判断有没有额外的空间 额外空间大小 == additional
+    /// 如果 position 为 0 说明没有读取过数据，不需要移动
+    /// 如果 bytes 的容量减去 bytes 的长度大于等于 additional，说明容量足够，不需要移动
+    /// 如果不满足上面两个条件，说明需要移动，清空 bytes 数组，设置 position 为 0
     fn maybe_unshift(&mut self, additional: usize) {
+        // 如果 position 为 0，说明没有读取过数据，不需要移动
         if self.pos == 0 {
             // nothing to do
             return;
         }
 
+        // 如果容量足够，不需要移动
         if self.bytes.capacity() - self.bytes.len() >= additional {
             // there's room!
             return;
         }
-
+        // 清空 bytes 数组
         self.bytes.drain(0..self.pos);
+        // 设置 position 为0
         self.pos = 0;
     }
 
