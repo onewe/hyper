@@ -507,7 +507,11 @@ impl Builder {
             // 创建一个 channel, 
             let (tx, rx) = dispatch::channel();
             let mut conn = proto::Conn::new(io);
+
+            // 设置 http1 解析配置
             conn.set_h1_parser_config(opts.h1_parser_config);
+
+            // 设置写入 buf 的策略
             if let Some(writev) = opts.h1_writev {
                 if writev {
                     conn.set_write_strategy_queue();

@@ -115,6 +115,7 @@ where
         cx: &mut task::Context<'_>,
         should_shutdown: bool,
     ) -> Poll<crate::Result<Dispatched>> {
+        // 调用 poll_inner
         Poll::Ready(ready!(self.poll_inner(cx, should_shutdown)).or_else(|e| {
             // An error means we're shutting down either way.
             // We just try to give the error to the user,
@@ -132,6 +133,7 @@ where
     ) -> Poll<crate::Result<Dispatched>> {
         T::update_date();
 
+        
         ready!(self.poll_loop(cx))?;
 
         if self.is_done() {
@@ -155,6 +157,7 @@ where
         // 16 was chosen arbitrarily, as that is number of pipelined requests
         // benchmarks often use. Perhaps it should be a config option instead.
         for _ in 0..16 {
+            // 读取数据
             let _ = self.poll_read(cx)?;
             let _ = self.poll_write(cx)?;
             let _ = self.poll_flush(cx)?;
@@ -180,9 +183,13 @@ where
 
     fn poll_read(&mut self, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
         loop {
+            // 判断 dispatch 是否已经关闭 如果已经关闭直接返回 ready
             if self.is_closing {
                 return Poll::Ready(Ok(()));
+
+                // 判断连接是否可以读取 header
             } else if self.conn.can_read_head() {
+                // 读取 header
                 ready!(self.poll_read_head(cx))?;
             } else if let Some(mut body) = self.body_tx.take() {
                 if self.conn.can_read_body() {
@@ -232,8 +239,12 @@ where
         }
     }
 
+    /***
+     * 读取请求头
+     */
     fn poll_read_head(&mut self, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
         // can dispatch receive, or does it still care about other incoming message?
+        // 判断 dispatch 是否可以接收消息, 这里的 dispatch 是 client
         match ready!(self.dispatch.poll_ready(cx)) {
             Ok(()) => (),
             Err(()) => {
@@ -420,6 +431,7 @@ where
 
     #[inline]
     fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        // 调用 poll_catch 推动整个异步流程
         self.poll_catch(cx, true)
     }
 }
@@ -628,6 +640,7 @@ cfg_client! {
         }
 
         fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), ()>> {
+            // 判断 client 中是否有 callback, 如果有 callback 了说明已经有请求在处理了
             match self.callback {
                 Some(ref mut cb) => match cb.poll_canceled(cx) {
                     Poll::Ready(()) => {

@@ -80,6 +80,7 @@ where
     #[cfg(feature = "server")]
     pub(crate) fn set_flush_pipeline(&mut self, enabled: bool) {
         debug_assert!(!self.write_buf.has_remaining());
+        // 开启了 flush_pipeline 之后，write_buf 的写入策略会变成 flatten
         self.flush_pipeline = enabled;
         if enabled {
             self.set_write_strategy_flatten();
@@ -92,12 +93,15 @@ where
             "The max_buf_size cannot be smaller than {}.",
             MINIMUM_MAX_BUFFER_SIZE,
         );
+        // 设置读取策略的最大值
+        // 设置写入 buf 的最大值
         self.read_buf_strategy = ReadStrategy::with_max(max);
         self.write_buf.max_buf_size = max;
     }
 
     #[cfg(feature = "client")]
     pub(crate) fn set_read_buf_exact_size(&mut self, sz: usize) {
+        // 设置读取策略 为 Exact 并且指定大小
         self.read_buf_strategy = ReadStrategy::Exact(sz);
     }
 
@@ -105,6 +109,7 @@ where
         // this should always be called only at construction time,
         // so this assert is here to catch myself
         debug_assert!(self.write_buf.queue.bufs_cnt() == 0);
+        // 设置写入策略为 flatten
         self.write_buf.set_strategy(WriteStrategy::Flatten);
     }
 
@@ -112,22 +117,26 @@ where
         // this should always be called only at construction time,
         // so this assert is here to catch myself
         debug_assert!(self.write_buf.queue.bufs_cnt() == 0);
+        // 设置写入策略为 queue
         self.write_buf.set_strategy(WriteStrategy::Queue);
     }
 
     pub(crate) fn read_buf(&self) -> &[u8] {
+        // 返回读取的 buf 切片
         self.read_buf.as_ref()
     }
 
     #[cfg(test)]
     #[cfg(feature = "nightly")]
     pub(super) fn read_buf_mut(&mut self) -> &mut BytesMut {
+        // 返回可变的 read_buf 引用
         &mut self.read_buf
     }
 
     /// Return the "allocated" available space, not the potential space
     /// that could be allocated in the future.
     fn read_buf_remaining_mut(&self) -> usize {
+        // 返回 read_buf 剩余大小
         self.read_buf.capacity() - self.read_buf.len()
     }
 
@@ -137,10 +146,12 @@ where
     /// - The write buf is in queue mode, and some of the past body is still
     ///   needing to be flushed.
     pub(crate) fn can_headers_buf(&self) -> bool {
+        // 判断队列中的是否还剩余 可用空间
         !self.write_buf.queue.has_remaining()
     }
 
     pub(crate) fn headers_buf(&mut self) -> &mut Vec<u8> {
+        // 返回可变的 headers_buf 引用
         let buf = self.write_buf.headers_mut();
         &mut buf.bytes
     }
@@ -150,14 +161,20 @@ where
     }
 
     pub(crate) fn buffer<BB: Buf + Into<B>>(&mut self, buf: BB) {
+        // 将 buf 写入到 write_buf 中
         self.write_buf.buffer(buf)
     }
 
     pub(crate) fn can_buffer(&self) -> bool {
+        // 如果 flush_pipeline 为 true 或者 write_buf 可以 buffer 则返回 true
         self.flush_pipeline || self.write_buf.can_buffer()
     }
 
+    /***
+     * 消费换行符
+     */
     pub(crate) fn consume_leading_lines(&mut self) {
+        // 判断 read_buf 是否为空
         if !self.read_buf.is_empty() {
             let mut i = 0;
             while i < self.read_buf.len() {
@@ -354,6 +371,9 @@ where
 // The `B` is a `Buf`, we never project a pin to it
 impl<T: Unpin, B> Unpin for Buffered<T, B> {}
 
+/***
+ * 这个过期了 不打算看了
+ */
 // TODO: This trait is old... at least rename to PollBytes or something...
 pub(crate) trait MemRead {
     fn read_mem(&mut self, cx: &mut task::Context<'_>, len: usize) -> Poll<io::Result<Bytes>>;
@@ -375,18 +395,24 @@ where
     }
 }
 
+/**
+ * 读取策略
+ */
 #[derive(Clone, Copy, Debug)]
 enum ReadStrategy {
+    // 适应性读取
     Adaptive {
         decrease_now: bool,
         next: usize,
         max: usize,
     },
     #[cfg(feature = "client")]
+    // 精确读取
     Exact(usize),
 }
 
 impl ReadStrategy {
+    // 创建一个适应性读取策略 指定最大值
     fn with_max(max: usize) -> ReadStrategy {
         ReadStrategy::Adaptive {
             decrease_now: false,
@@ -397,35 +423,47 @@ impl ReadStrategy {
 
     fn next(&self) -> usize {
         match *self {
+            // next 为 Adaptive 中的 next 字段
             ReadStrategy::Adaptive { next, .. } => next,
             #[cfg(feature = "client")]
+            // next 为 Exact 中的 exact 字段
             ReadStrategy::Exact(exact) => exact,
         }
     }
 
     fn max(&self) -> usize {
         match *self {
+            // max 为 Adaptive 中的 max 字段
             ReadStrategy::Adaptive { max, .. } => max,
             #[cfg(feature = "client")]
+            // max 为 Exact 中的 exact 字段
             ReadStrategy::Exact(exact) => exact,
         }
     }
 
     fn record(&mut self, bytes_read: usize) {
         match *self {
+            // 自适应的大概逻辑 如果读取的字节数大于等于 next 则 next 进行翻倍处理, 切保证不能超过 max 限制
+            // 如果读取的字节数小于 next , 则 next 则进行减半处理, 如果读取的字节数小于减半后的值, 则 next 稳定在 INIT_BUFFER_SIZE 
             ReadStrategy::Adaptive {
                 ref mut decrease_now,
                 ref mut next,
                 max,
                 ..
             } => {
+                
+                // 判断 读取的字节数 是否大于等于 next
                 if bytes_read >= *next {
+                    // 2 * next 与 max 谁更小 , 取最小值作为 next 以免超过 max 限制
                     *next = cmp::min(incr_power_of_two(*next), max);
                     *decrease_now = false;
                 } else {
                     let decr_to = prev_power_of_two(*next);
+                    // 判断读取的字节数 是否小于 decr_to
                     if bytes_read < decr_to {
                         if *decrease_now {
+                            // 判断 decr_to INIT_BUFFER_SIZE 谁更大, 取最大值作为 next
+                            // 保证不会低于 INIT_BUFFER_SIZE
                             *next = cmp::max(decr_to, INIT_BUFFER_SIZE);
                             *decrease_now = false;
                         } else {
@@ -446,16 +484,28 @@ impl ReadStrategy {
     }
 }
 
+/***
+ * 一个不会超过边界的乘法算法
+ */
 fn incr_power_of_two(n: usize) -> usize {
     n.saturating_mul(2)
 }
 
+/***
+ * 也就是说这个方法保证 n 要大于等于 4
+ * 如果小于 4 则返回 1
+ * 一个简单粗暴的减半算法
+ */
 fn prev_power_of_two(n: usize) -> usize {
     // Only way this shift can underflow is if n is less than 4.
     // (Which would means `usize::MAX >> 64` and underflowed!)
     debug_assert!(n >= 4);
+    // 这个得解释一下 例如 一个 8位的二进制数 0111 1111
+    // 1. 0000 1110 == 14 前导0的个数是 4
+    // 2. 总共位移 4 + 2 = 6 位 0111 1111 >> 6 = 0000 0001 == 1 and then 1 + 1 == 2
     (::std::usize::MAX >> (n.leading_zeros() + 2)) + 1
 }
+
 
 impl Default for ReadStrategy {
     fn default() -> ReadStrategy {

@@ -60,6 +60,9 @@ macro_rules! maybe_panic {
     })
 }
 
+/***
+ * 解析 http header
+ */
 pub(super) fn parse_headers<T>(
     bytes: &mut BytesMut,
     ctx: ParseContext<'_>,
@@ -930,6 +933,7 @@ impl Http1Transaction for Client {
 
     fn parse(buf: &mut BytesMut, ctx: ParseContext<'_>) -> ParseResult<StatusCode> {
         debug_assert!(!buf.is_empty(), "parse called with empty buf");
+        // 解析 http 请求
 
         // Loop to skip information status code headers (100 Continue, etc).
         loop {
@@ -942,8 +946,11 @@ impl Http1Transaction for Client {
                 // SAFETY: We can go safely from MaybeUninit array to array of MaybeUninit
                 let mut headers: [MaybeUninit<httparse::Header<'_>>; MAX_HEADERS] =
                     unsafe { MaybeUninit::uninit().assume_init() };
+                
+                // 解析 response
                 trace!(bytes = buf.len(), "Response.parse");
                 let mut res = httparse::Response::new(&mut []);
+                // 获取 response 的 bytes
                 let bytes = buf.as_ref();
                 match ctx.h1_parser_config.parse_response_with_uninit_headers(
                     &mut res,
