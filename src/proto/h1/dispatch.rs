@@ -181,18 +181,24 @@ where
         task::yield_now(cx).map(|never| match never {})
     }
 
+    /***
+     * 读取数据 这里读取数据对于客户端来说 是读取 response 对于服务端来说是读取 request
+     */
     fn poll_read(&mut self, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
         loop {
             // 判断 dispatch 是否已经关闭 如果已经关闭直接返回 ready
             if self.is_closing {
                 return Poll::Ready(Ok(()));
 
-                // 判断连接是否可以读取 header
+                // 先判断是否可以读取 header 如果可以读取 header 在下次循环中读取 body
             } else if self.conn.can_read_head() {
                 // 读取 header
                 ready!(self.poll_read_head(cx))?;
             } else if let Some(mut body) = self.body_tx.take() {
                 if self.conn.can_read_body() {
+                    // 判断 body 也就是发送 body 数据到 client 那侧的 sender 是否准备好
+                    // 包括 client 那侧是否在读取 body 数据 如果没有读取 body 不忙发送数据
+                    // 如果 发送数据的 channel 满了 也不忙发送数据
                     match body.poll_ready(cx) {
                         Poll::Ready(Ok(())) => (),
                         Poll::Pending => {
@@ -207,9 +213,12 @@ where
                             continue;
                         }
                     }
+                    // 读取 body 数据
                     match self.conn.poll_read_body(cx) {
+                        // 把读取的数据 发送到 sender 对端的 receiver
                         Poll::Ready(Some(Ok(chunk))) => match body.try_send_data(chunk) {
                             Ok(()) => {
+                                // 发送成功 重置 body 方便后面循环读取
                                 self.body_tx = Some(body);
                             }
                             Err(_canceled) => {
@@ -219,13 +228,16 @@ where
                                 }
                             }
                         },
+                        // 数据已经读取完毕 drop 就行
                         Poll::Ready(None) => {
                             // just drop, the body will close automatically
                         }
+                        // 数据还未准备好 pending
                         Poll::Pending => {
                             self.body_tx = Some(body);
                             return Poll::Pending;
                         }
+                        // 读取数据出错 把错误发送到 receiver 端
                         Poll::Ready(Some(Err(e))) => {
                             body.send_error(crate::Error::new_body(e));
                         }
@@ -234,6 +246,7 @@ where
                     // just drop, the body will close automatically
                 }
             } else {
+                // keep-alive
                 return self.conn.poll_read_keep_alive(cx);
             }
         }
@@ -255,6 +268,7 @@ where
         }
 
         // dispatch is ready for a message, try to read one
+        // 从真实的连接里读取 header 数据 
         match ready!(self.conn.poll_read_head(cx)) {
             Some(Ok((mut head, body_len, wants))) => {
                 let body = match body_len {
@@ -301,15 +315,21 @@ where
 
     fn poll_write(&mut self, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
         loop {
+            // 判断是否已经关闭 如果已经关闭直接 return ready
             if self.is_closing {
                 return Poll::Ready(Ok(()));
+                // 判断 body_rx 是否处于 none, 
+                // 判断 连接是否可以写 header
+                // 如果没有发送过信息 callback 必定为 none , should_poll 必定为 true
             } else if self.body_rx.is_none()
                 && self.conn.can_write_head()
                 && self.dispatch.should_poll()
             {
                 if let Some(msg) = ready!(Pin::new(&mut self.dispatch).poll_msg(cx)) {
+                    // 获取到 message 
                     let (head, body) = msg.map_err(crate::Error::new_user_service)?;
-
+                    
+                    // 判断 body 是否已经结束
                     let body_type = if body.is_end_stream() {
                         self.body_rx.set(None);
                         None
@@ -322,58 +342,74 @@ where
                         self.body_rx.set(Some(body));
                         btype
                     };
+                    // 写入 header
                     self.conn.write_head(head, body_type);
                 } else {
                     self.close();
                     return Poll::Ready(Ok(()));
                 }
             } else if !self.conn.can_buffer_body() {
+                // 如果不能缓存 body 先冲刷一部分出去
                 ready!(self.poll_flush(cx))?;
             } else {
+                // 1. 在连接不能写入 body 时 clear_body
+                // 2. 在获取 body 报错时 clear_body
+                // 3. 在 body 结束时 clear_body
                 // A new scope is needed :(
                 if let (Some(mut body), clear_body) =
                     OptGuard::new(self.body_rx.as_mut()).guard_mut()
                 {
+                    // 判断连接是否能写入 body
                     debug_assert!(!*clear_body, "opt guard defaults to keeping body");
                     if !self.conn.can_write_body() {
                         trace!(
                             "no more write body allowed, user body is_end_stream = {}",
                             body.is_end_stream(),
                         );
+                        
                         *clear_body = true;
                         continue;
                     }
 
+                    // 拉取 body 值
                     let item = ready!(body.as_mut().poll_frame(cx));
                     if let Some(item) = item {
                         let frame = item.map_err(|e| {
                             *clear_body = true;
                             crate::Error::new_user_body(e)
                         })?;
+                        // 转换为 chunk
                         let chunk = if let Ok(data) = frame.into_data() {
                             data
                         } else {
                             trace!("discarding non-data frame");
                             continue;
                         };
+                        // 判断数据流是否 end
                         let eos = body.is_end_stream();
                         if eos {
                             *clear_body = true;
+                            // 如果已没有多余空间 则 直接 end
                             if chunk.remaining() == 0 {
                                 trace!("discarding empty chunk");
                                 self.conn.end_body()?;
                             } else {
+                                // 写入 body 和 结束符
                                 self.conn.write_body_and_end(chunk);
                             }
                         } else {
+                            // 丢弃空 chunk
                             if chunk.remaining() == 0 {
                                 trace!("discarding empty chunk");
                                 continue;
                             }
+                            // 写入 chunk
                             self.conn.write_body(chunk);
                         }
                     } else {
+                        // 没有获取消息
                         *clear_body = true;
+                        // 结束
                         self.conn.end_body()?;
                     }
                 } else {
@@ -572,14 +608,18 @@ cfg_client! {
         ) -> Poll<Option<Result<(Self::PollItem, Self::PollBody), crate::common::Never>>> {
             let mut this = self.as_mut();
             debug_assert!(!this.rx_closed);
+            // 拉取 sender 端发送的消息
             match this.rx.poll_recv(cx) {
                 Poll::Ready(Some((req, mut cb))) => {
                     // check that future hasn't been canceled already
+                    // 检查 callback 回调端是否被 取消
                     match cb.poll_canceled(cx) {
+                        // 回调端已被 取消
                         Poll::Ready(()) => {
                             trace!("request canceled");
                             Poll::Ready(None)
                         }
+                        // 回调端还存在
                         Poll::Pending => {
                             let (parts, body) = req.into_parts();
                             let head = RequestHead {
@@ -588,17 +628,20 @@ cfg_client! {
                                 headers: parts.headers,
                                 extensions: parts.extensions,
                             };
+                            // 设置回调 sender
                             this.callback = Some(cb);
                             Poll::Ready(Some(Ok((head, body))))
                         }
                     }
                 }
+                // 如果没有拉取到消息 则表示 发送端已经被 drop 掉
                 Poll::Ready(None) => {
                     // user has dropped sender handle
                     trace!("client tx closed");
                     this.rx_closed = true;
                     Poll::Ready(None)
                 }
+                // 如果没有消息则 pending
                 Poll::Pending => Poll::Pending,
             }
         }
@@ -640,6 +683,7 @@ cfg_client! {
         }
 
         fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), ()>> {
+            // 只有 发送请求后 client 中的 callback 才会有值
             // 判断 client 中是否有 callback, 如果有 callback 了说明已经有请求在处理了
             match self.callback {
                 Some(ref mut cb) => match cb.poll_canceled(cx) {
